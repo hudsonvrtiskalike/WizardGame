@@ -1,0 +1,1084 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Boney in Ancient Greece</title>
+<style>
+  body {
+    margin: 0;
+    background: #0a0800;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    font-family: monospace;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    border: 3px solid #c8a020;
+    box-shadow: 0 0 24px #c8a020aa;
+  }
+</style>
+</head>
+<body>
+<canvas id="c" width="640" height="528"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+const TILE = 32;
+const COLS = 20;
+const ROWS = 15;
+const WORLD_H = ROWS * TILE;   // 480
+const HUD_H = 48;
+const CAR_W = 28, CAR_H = 18;
+
+// ─── World Map ──────────────────────────────────────────────────────────────
+// T=grass(0), S=sand(1), R=road(2), W=water(3), H=shop(4), P=temple(5)
+const MAP = [];
+for (let r = 0; r < ROWS; r++) {
+  MAP.push([]);
+  for (let c = 0; c < COLS; c++) {
+    let t = 0; // default grass border
+    if (r > 0 && r < ROWS-1 && c > 0 && c < COLS-1) t = 1; // sand interior
+    if (r === 6 || c === 8) t = 2; // roads
+    if (r >= 11 && c >= 14) t = 3; // water bottom-right corner
+    MAP[r].push(t);
+  }
+}
+// Shops
+const SHOPS = [
+  { name: "Boney's Diner",   type: "food",    tx: 2,  ty: 2,  color: "#d44" },
+  { name: "Skull Cuts",       type: "haircut", tx: 2,  ty: 9,  color: "#44d" },
+  { name: "Boney's Garage",   type: "car",     tx: 15, ty: 10, color: "#4a4" },
+];
+SHOPS.forEach(s => {
+  MAP[s.ty][s.tx] = 4;
+  MAP[s.ty][s.tx+1] = 4;
+});
+// Temples
+[[11,2],[11,3],[12,2],[12,3],[11,15],[11,16],[12,15],[12,16]].forEach(([r,c])=>{ if(MAP[r][c]!==3) MAP[r][c]=5; });
+
+// ─── State ──────────────────────────────────────────────────────────────────
+let state, player, car, customers, guards, socrates;
+let wantedTimer, socratesTimer, tick;
+let keys = {};
+let notification = '', notifTimer = 0;
+let contextHint = '';
+let dialogOpen = false, dialogQ, dialogA1, dialogA2, dialogNPC;
+let shopOpen = false, shopRef;
+let gameOver = false;
+let score = 0;
+
+// Philosophical dialogues
+const DIALOGUES = [
+  { q: ["Is it not true that justice is the", "advantage of the stronger?"],
+    a1: ["1: Nay, justice serves all equally.", "+3 REP"],
+    a2: ["2: Perhaps wisdom transcends strength.", "+2 REP"],
+    r1: 3, r2: 2 },
+  { q: ["What is the examined life you avoid,", "skeleton?"],
+    a1: ["1: I examine my bones daily, Socrates.", "+2 REP"],
+    a2: ["2: Busy running shops, no time to think.", "+1 REP"],
+    r1: 2, r2: 1 },
+  { q: ["Do you know that you know nothing,", "Boney?"],
+    a1: ["1: I know I must serve my customers!", "+3 REP"],
+    a2: ["2: I know my gold — is that enough?", "+1 REP"],
+    r1: 3, r2: 1 },
+  { q: ["Virtue is knowledge — does a skeleton", "possess virtue?"],
+    a1: ["1: My virtuous bones never rust!", "+3 REP"],
+    a2: ["2: Define virtue first, old man.", "+2 REP"],
+    r1: 3, r2: 2 },
+];
+
+const CITIZEN_NAMES = ["Aristotle","Plato","Pericles","Thales","Pythagoras","Herodotus","Xenophon"];
+const WANTS = ["food","haircut","car"];
+
+function initGame() {
+  score = 0;
+  gameOver = false;
+  tick = 0;
+  dialogOpen = false;
+  shopOpen = false;
+  wantedTimer = 0;
+  socratesTimer = 0;
+  notification = '';
+  notifTimer = 0;
+
+  player = {
+    x: 9 * TILE + 4, y: 7 * TILE + 4,
+    w: 16, h: 24,
+    vx: 0, vy: 0,
+    speed: 2,
+    hp: 5, rep: 5, gold: 50, wanted: 0,
+    inCar: false,
+    dir: 0, // 0=down,1=up,2=left,3=right
+    animFrame: 0, animTick: 0,
+  };
+
+  car = {
+    x: 9 * TILE + TILE, y: 7 * TILE - 10,
+    w: CAR_W, h: CAR_H,
+    vx: 0, vy: 0,
+    speed: 4, angle: 0,
+  };
+
+  customers = [];
+  guards = [];
+  for (let i = 0; i < 3; i++) spawnGuard();
+  for (let i = 0; i < 4; i++) spawnCustomer();
+
+  socrates = {
+    x: 3 * TILE, y: 10 * TILE,
+    w: 16, h: 24,
+    vx: 0, vy: 0,
+    hp: 4, state: 'idle', // idle,walking,talking,fleeing
+    animFrame: 0, animTick: 0,
+    label: 'Socrates',
+  };
+}
+
+// ─── Spawning ────────────────────────────────────────────────────────────────
+function randRoad() {
+  // spawn on sand, not near roads or water
+  let x, y, tries = 0;
+  do {
+    x = (2 + Math.floor(Math.random() * 16)) * TILE;
+    y = (2 + Math.floor(Math.random() * 11)) * TILE;
+    tries++;
+  } while (tries < 50 && (tileAt(x+8,y+8) !== 1));
+  return { x, y };
+}
+
+function spawnCustomer() {
+  let pos = randRoad();
+  let name = CITIZEN_NAMES[Math.floor(Math.random() * CITIZEN_NAMES.length)];
+  let want = WANTS[Math.floor(Math.random() * WANTS.length)];
+  customers.push({
+    x: pos.x + 8, y: pos.y + 8,
+    w: 14, h: 22,
+    name, want,
+    vx: 0, vy: 0,
+    state: 'wandering', waitTimer: 0,
+    moveTimer: 0, targetX: pos.x, targetY: pos.y,
+    animFrame: 0, animTick: 0,
+    color: '#' + Math.floor(Math.random()*0xaaaaaa+0x444444).toString(16).padStart(6,'0'),
+  });
+}
+
+function spawnGuard() {
+  let pos = randRoad();
+  guards.push({
+    x: pos.x + 8, y: pos.y + 8,
+    w: 14, h: 24,
+    hp: 3,
+    vx: 0, vy: 0,
+    state: 'patrol',
+    patrolDir: Math.floor(Math.random()*4),
+    patrolTimer: 60 + Math.floor(Math.random()*120),
+    animFrame: 0, animTick: 0,
+  });
+}
+
+// ─── Tile helpers ─────────────────────────────────────────────────────────────
+function tileAt(px, py) {
+  let c = Math.floor(px / TILE);
+  let r = Math.floor(py / TILE);
+  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return 0;
+  return MAP[r][c];
+}
+
+function isSolid(px, py) {
+  let t = tileAt(px, py);
+  return t === 0 || t === 3; // grass border and water are solid
+}
+
+function collidesWorld(x, y, w, h) {
+  // check 4 corners
+  return isSolid(x+2,y+2) || isSolid(x+w-3,y+2) || isSolid(x+2,y+h-3) || isSolid(x+w-3,y+h-3);
+}
+
+function rectsOverlap(ax,ay,aw,ah, bx,by,bw,bh) {
+  return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+}
+
+function dist(ax,ay,bx,by) {
+  return Math.hypot(ax-bx, ay-by);
+}
+
+// ─── Input ────────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (gameOver) {
+    if (e.key === 'r' || e.key === 'R') initGame();
+    return;
+  }
+  if (dialogOpen) {
+    if (e.key === '1') resolveDialogue(0);
+    if (e.key === '2') resolveDialogue(1);
+    if (e.key === 'f' || e.key === 'F') fightSocrates();
+    return;
+  }
+  if (shopOpen) {
+    if (e.key === 'e' || e.key === 'E') shopOpen = false;
+    return;
+  }
+  if (e.key === 'e' || e.key === 'E') handleInteract();
+  if (e.key === 'f' || e.key === 'F') handleFight();
+  if (e.key === 'r' || e.key === 'R') handleCarToggle();
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+// ─── Interaction ──────────────────────────────────────────────────────────────
+function handleInteract() {
+  let px = player.x + player.w/2;
+  let py = player.y + player.h/2;
+
+  // Check customers
+  for (let i = 0; i < customers.length; i++) {
+    let c = customers[i];
+    if (c.state === 'waiting' && dist(px,py, c.x+c.w/2, c.y+c.h/2) < 50) {
+      // find matching shop
+      let shop = SHOPS.find(s => s.type === c.want);
+      if (shop) {
+        let sx = shop.tx * TILE + TILE;
+        let sy = shop.ty * TILE + TILE;
+        if (dist(px,py, sx, sy) < 64) {
+          // serve customer
+          score += 10;
+          player.gold += 20 + Math.floor(Math.random()*10);
+          player.rep = Math.min(10, player.rep + 1);
+          setNotif(`Served ${c.name}! +20 gold +1 rep`);
+          customers.splice(i, 1);
+          setTimeout(spawnCustomer, 3000);
+          return;
+        }
+      }
+    }
+  }
+
+  // Check shops
+  for (let s of SHOPS) {
+    let sx = s.tx * TILE;
+    let sy = s.ty * TILE;
+    if (dist(px,py, sx+TILE, sy+TILE) < 60) {
+      shopRef = s;
+      shopOpen = true;
+      return;
+    }
+  }
+}
+
+function handleFight() {
+  let px = player.x + player.w/2;
+  let py = player.y + player.h/2;
+
+  // Fight guards
+  for (let i = guards.length-1; i >= 0; i--) {
+    let g = guards[i];
+    if (dist(px,py, g.x+g.w/2, g.y+g.h/2) < 40) {
+      g.hp--;
+      if (g.hp <= 0) {
+        guards.splice(i,1);
+        score += 20;
+        player.wanted = Math.max(0, player.wanted - 1);
+        setNotif('Guard defeated! +20 score');
+        setTimeout(spawnGuard, 5000);
+      } else {
+        setNotif('Hit guard!');
+      }
+      return;
+    }
+  }
+
+  // Fight Socrates
+  if (socrates.state === 'talking' || dist(px,py, socrates.x+8, socrates.y+12) < 50) {
+    fightSocrates();
+  }
+}
+
+function handleCarToggle() {
+  if (gameOver) return;
+  let px = player.x + player.w/2;
+  let py = player.y + player.h/2;
+  let cx = car.x + car.w/2;
+  let cy = car.y + car.h/2;
+  if (!player.inCar && dist(px,py,cx,cy) < 50) {
+    player.inCar = true;
+    setNotif('Got in the car!');
+  } else if (player.inCar) {
+    player.inCar = false;
+    player.x = car.x + car.w + 4;
+    player.y = car.y;
+    setNotif('Got out of the car.');
+  }
+}
+
+function resolveDialogue(choice) {
+  if (!dialogQ) return;
+  let rep = choice === 0 ? dialogQ.r1 : dialogQ.r2;
+  player.rep = Math.min(10, player.rep + rep);
+  score += rep * 5;
+  setNotif(`Wise answer! +${rep} rep`);
+  dialogOpen = false;
+  socrates.state = 'fleeing';
+  socrates.vx = -2; socrates.vy = -1;
+}
+
+function fightSocrates() {
+  dialogOpen = false;
+  socrates.hp--;
+  if (socrates.hp <= 0) {
+    score += 30;
+    socrates.state = 'idle';
+    socrates.x = 3 * TILE; socrates.y = 10 * TILE;
+    socrates.hp = 4;
+    socratesTimer = 0;
+    setNotif('You defeated Socrates! +30 score');
+    player.wanted = Math.min(5, player.wanted + 1);
+  } else {
+    socrates.state = 'fleeing';
+    setNotif('Socrates flees!');
+    player.wanted = Math.min(5, player.wanted + 1);
+  }
+}
+
+// ─── Update functions ─────────────────────────────────────────────────────────
+function updatePlayer() {
+  if (player.inCar) {
+    updateCarDriving();
+    return;
+  }
+
+  let dx = 0, dy = 0;
+  if (keys['ArrowLeft']  || keys['a'] || keys['A']) dx = -1;
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) dx = 1;
+  if (keys['ArrowUp']    || keys['w'] || keys['W']) dy = -1;
+  if (keys['ArrowDown']  || keys['s'] || keys['S']) dy = 1;
+
+  if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+
+  let spd = player.speed;
+  let nx = player.x + dx * spd;
+  let ny = player.y + dy * spd;
+
+  if (!collidesWorld(nx, player.y, player.w, player.h)) player.x = nx;
+  if (!collidesWorld(player.x, ny, player.w, player.h)) player.y = ny;
+
+  player.x = Math.max(0, Math.min(COLS*TILE - player.w, player.x));
+  player.y = Math.max(0, Math.min(ROWS*TILE - player.h, player.y));
+
+  if (dx !== 0 || dy !== 0) {
+    player.animTick++;
+    if (player.animTick > 8) { player.animTick = 0; player.animFrame = (player.animFrame+1)%4; }
+    if (dx < 0) player.dir = 2;
+    else if (dx > 0) player.dir = 3;
+    else if (dy < 0) player.dir = 1;
+    else player.dir = 0;
+  } else {
+    player.animFrame = 0;
+  }
+
+  // check guard collisions
+  for (let g of guards) {
+    if (rectsOverlap(player.x,player.y,player.w,player.h, g.x,g.y,g.w,g.h)) {
+      if (g.state === 'chasing') {
+        player.hp--;
+        g.x += 30; g.y += 30; // bounce guard away
+        if (player.hp <= 0) { gameOver = true; setNotif('ARRESTED!'); }
+        player.wanted = Math.min(5, player.wanted + 1);
+        setNotif('Guard caught you! -1 HP');
+      }
+    }
+  }
+}
+
+function updateCarDriving() {
+  let dx = 0, dy = 0;
+  if (keys['ArrowLeft']  || keys['a'] || keys['A']) dx = -1;
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) dx = 1;
+  if (keys['ArrowUp']    || keys['w'] || keys['W']) dy = -1;
+  if (keys['ArrowDown']  || keys['s'] || keys['S']) dy = 1;
+
+  let spd = car.speed;
+  let nx = car.x + dx * spd;
+  let ny = car.y + dy * spd;
+
+  if (!collidesWorld(nx, car.y, car.w, car.h)) car.x = nx;
+  if (!collidesWorld(car.x, ny, car.w, car.h)) car.y = ny;
+
+  car.x = Math.max(0, Math.min(COLS*TILE - car.w, car.x));
+  car.y = Math.max(0, Math.min(ROWS*TILE - car.h, car.y));
+
+  player.x = car.x + 1;
+  player.y = car.y + 1;
+
+  // run over guards
+  for (let i = guards.length-1; i >= 0; i--) {
+    let g = guards[i];
+    if (rectsOverlap(car.x,car.y,car.w,car.h, g.x,g.y,g.w,g.h)) {
+      g.hp -= 2;
+      score += 5;
+      if (g.hp <= 0) {
+        guards.splice(i,1);
+        score += 5;
+        player.wanted = Math.min(5, player.wanted + 2);
+        setNotif('Guard run over! +10 score');
+        setTimeout(spawnGuard, 6000);
+      }
+    }
+  }
+}
+
+function updateCar() {
+  // Car physics / idle update placeholder
+  // (movement handled in updateCarDriving when player is inside)
+}
+
+function updateCustomers() {
+  for (let c of customers) {
+    c.animTick++;
+    if (c.animTick > 12) { c.animTick = 0; c.animFrame = (c.animFrame+1)%4; }
+
+    if (c.state === 'wandering') {
+      c.moveTimer--;
+      if (c.moveTimer <= 0) {
+        c.moveTimer = 80 + Math.floor(Math.random()*120);
+        if (Math.random() < 0.3) {
+          c.state = 'waiting';
+          c.waitTimer = 400 + Math.floor(Math.random()*300);
+        } else {
+          let pos = randRoad();
+          c.targetX = pos.x + 8;
+          c.targetY = pos.y + 8;
+        }
+      }
+      let ddx = c.targetX - c.x, ddy = c.targetY - c.y;
+      let dd = Math.hypot(ddx, ddy);
+      if (dd > 2) {
+        c.vx = ddx/dd; c.vy = ddy/dd;
+      } else {
+        c.vx = 0; c.vy = 0;
+      }
+      let nx = c.x + c.vx;
+      let ny = c.y + c.vy;
+      if (!collidesWorld(nx, c.y, c.w, c.h)) c.x = nx;
+      if (!collidesWorld(c.x, ny, c.w, c.h)) c.y = ny;
+    } else if (c.state === 'waiting') {
+      c.vx = 0; c.vy = 0;
+      c.waitTimer--;
+      if (c.waitTimer <= 0) {
+        c.state = 'wandering';
+        c.moveTimer = 80;
+      }
+    }
+  }
+}
+
+function updateGuards() {
+  let px = player.x + player.w/2;
+  let py = player.y + player.h/2;
+
+  for (let g of guards) {
+    g.animTick++;
+    if (g.animTick > 10) { g.animTick = 0; g.animFrame = (g.animFrame+1)%4; }
+
+    if (player.wanted >= 1) {
+      g.state = 'chasing';
+    } else {
+      g.state = 'patrol';
+    }
+
+    if (g.state === 'chasing') {
+      let ddx = px - (g.x+g.w/2), ddy = py - (g.y+g.h/2);
+      let dd = Math.hypot(ddx, ddy);
+      if (dd > 2) {
+        g.vx = ddx/dd * 1.5; g.vy = ddy/dd * 1.5;
+      }
+    } else {
+      // patrol
+      g.patrolTimer--;
+      if (g.patrolTimer <= 0) {
+        g.patrolTimer = 60 + Math.floor(Math.random()*120);
+        g.patrolDir = Math.floor(Math.random()*4);
+      }
+      const PDIRS = [[0,-1],[0,1],[-1,0],[1,0]];
+      g.vx = PDIRS[g.patrolDir][0];
+      g.vy = PDIRS[g.patrolDir][1];
+    }
+
+    let nx = g.x + g.vx;
+    let ny = g.y + g.vy;
+    if (!collidesWorld(nx, g.y, g.w, g.h)) g.x = nx;
+    else { g.vx = 0; g.patrolDir = Math.floor(Math.random()*4); }
+    if (!collidesWorld(g.x, ny, g.w, g.h)) g.y = ny;
+    else { g.vy = 0; g.patrolDir = Math.floor(Math.random()*4); }
+
+    g.x = Math.max(0, Math.min(COLS*TILE-g.w, g.x));
+    g.y = Math.max(0, Math.min(ROWS*TILE-g.h, g.y));
+  }
+}
+
+function updateSocrates() {
+  socratesTimer++;
+  let px = player.x + player.w/2;
+  let py = player.y + player.h/2;
+  let sx = socrates.x + 8;
+  let sy = socrates.y + 12;
+
+  if (socrates.state === 'idle') {
+    if (socratesTimer > 600) {
+      socrates.state = 'walking';
+      socratesTimer = 0;
+      setNotif('Socrates approaches...');
+    }
+  } else if (socrates.state === 'walking') {
+    let ddx = px - sx, ddy = py - sy;
+    let dd = Math.hypot(ddx, ddy);
+    if (dd < 40) {
+      socrates.state = 'talking';
+      socrates.vx = 0; socrates.vy = 0;
+      dialogOpen = true;
+      dialogQ = DIALOGUES[Math.floor(Math.random()*DIALOGUES.length)];
+    } else {
+      socrates.vx = ddx/dd * 1.2;
+      socrates.vy = ddy/dd * 1.2;
+    }
+  } else if (socrates.state === 'fleeing') {
+    socrates.vx = -2; socrates.vy = -1;
+    socratesTimer++;
+    if (socratesTimer > 180) {
+      socrates.state = 'idle';
+      socrates.x = 3*TILE; socrates.y = 10*TILE;
+      socrates.vx = 0; socrates.vy = 0;
+      socratesTimer = 0;
+    }
+  } else if (socrates.state === 'talking') {
+    socrates.vx = 0; socrates.vy = 0;
+  }
+
+  let nx = socrates.x + socrates.vx;
+  let ny = socrates.y + socrates.vy;
+  if (!collidesWorld(nx, socrates.y, 16, 24)) socrates.x = nx;
+  if (!collidesWorld(socrates.x, ny, 16, 24)) socrates.y = ny;
+  socrates.x = Math.max(0, Math.min(COLS*TILE-16, socrates.x));
+  socrates.y = Math.max(0, Math.min(ROWS*TILE-24, socrates.y));
+
+  socrates.animTick++;
+  if (socrates.animTick > 10) { socrates.animTick=0; socrates.animFrame=(socrates.animFrame+1)%4; }
+}
+
+function updateWanted() {
+  if (player.wanted > 0) {
+    wantedTimer++;
+    if (wantedTimer > 300) {
+      wantedTimer = 0;
+      player.wanted = Math.max(0, player.wanted - 1);
+    }
+  }
+}
+
+function updateContextHint() {
+  let px = player.x + player.w/2;
+  let py = player.y + player.h/2;
+  contextHint = '';
+
+  if (!player.inCar) {
+    let cx = car.x + car.w/2;
+    let cy = car.y + car.h/2;
+    if (dist(px,py,cx,cy) < 50) { contextHint = 'R — Get in car'; return; }
+  } else {
+    contextHint = 'R — Get out of car'; return;
+  }
+
+  for (let c of customers) {
+    if (c.state === 'waiting' && dist(px,py, c.x+c.w/2, c.y+c.h/2) < 50) {
+      contextHint = `E — Serve ${c.name} (${c.want})`; return;
+    }
+  }
+
+  for (let s of SHOPS) {
+    let sx = s.tx * TILE;
+    let sy = s.ty * TILE;
+    if (dist(px,py, sx+TILE, sy+TILE) < 60) {
+      contextHint = `E — Enter ${s.name}`; return;
+    }
+  }
+
+  for (let g of guards) {
+    if (dist(px,py, g.x+g.w/2, g.y+g.h/2) < 40) {
+      contextHint = 'F — Fight guard'; return;
+    }
+  }
+}
+
+function setNotif(msg) {
+  notification = msg;
+  notifTimer = 180;
+}
+
+// ─── Drawing ──────────────────────────────────────────────────────────────────
+function drawTile(c, r) {
+  let t = MAP[r][c];
+  let x = c * TILE, y = r * TILE;
+  if (t === 0) {
+    // grass
+    ctx.fillStyle = '#2d6a10';
+    ctx.fillRect(x,y,TILE,TILE);
+    ctx.strokeStyle = '#1a4a08';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < TILE; i += 8) {
+      ctx.strokeRect(x+i, y, 8, 8);
+    }
+  } else if (t === 1) {
+    // sand
+    ctx.fillStyle = '#c8a040';
+    ctx.fillRect(x,y,TILE,TILE);
+    ctx.fillStyle = '#b89030';
+    for (let i = 0; i < TILE; i += 8) {
+      for (let j = 0; j < TILE; j += 8) {
+        if ((i/8+j/8)%2===0) ctx.fillRect(x+i,y+j,8,8);
+      }
+    }
+  } else if (t === 2) {
+    // road
+    ctx.fillStyle = '#5a4020';
+    ctx.fillRect(x,y,TILE,TILE);
+    ctx.fillStyle = '#e8d060';
+    ctx.fillRect(x+TILE/2-2,y,4,TILE); // center line
+    ctx.fillRect(x,y+TILE/2-2,TILE,4);
+  } else if (t === 3) {
+    // water (animated)
+    let wt = (tick/10)|0;
+    ctx.fillStyle = '#1848c0';
+    ctx.fillRect(x,y,TILE,TILE);
+    ctx.fillStyle = `rgba(80,160,255,${0.4+0.3*Math.sin(wt*0.2+c+r)})`;
+    ctx.fillRect(x,y,TILE,TILE/2);
+    ctx.fillStyle = '#2060e0';
+    for (let i = 0; i < TILE; i += 6) {
+      ctx.fillRect(x+i, y+(wt+i)%TILE, 3, 2);
+    }
+  } else if (t === 4) {
+    // shop (stone floor)
+    ctx.fillStyle = '#a08050';
+    ctx.fillRect(x,y,TILE,TILE);
+    ctx.strokeStyle = '#806030';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x+2,y+2,TILE-4,TILE-4);
+  } else if (t === 5) {
+    // temple
+    ctx.fillStyle = '#e0d090';
+    ctx.fillRect(x,y,TILE,TILE);
+    ctx.fillStyle = '#c8b860';
+    for (let i = 4; i < TILE; i += 8) {
+      ctx.fillRect(x+i,y,4,TILE);
+    }
+  }
+}
+
+function drawWorld() {
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      drawTile(c,r);
+}
+
+function drawShops() {
+  for (let s of SHOPS) {
+    let x = s.tx * TILE, y = s.ty * TILE;
+    // building
+    ctx.fillStyle = '#a08050';
+    ctx.fillRect(x, y, TILE*2, TILE*1.5);
+    // roof triangle
+    ctx.fillStyle = s.color;
+    ctx.beginPath();
+    ctx.moveTo(x-4, y);
+    ctx.lineTo(x+TILE, y-16);
+    ctx.lineTo(x+TILE*2+4, y);
+    ctx.closePath();
+    ctx.fill();
+    // door
+    ctx.fillStyle = '#5a3010';
+    ctx.fillRect(x+TILE-6, y+TILE/2, 12, TILE*0.8);
+    // windows
+    ctx.fillStyle = '#90d8f0';
+    ctx.fillRect(x+4, y+6, 12, 10);
+    ctx.fillRect(x+TILE+8, y+6, 12, 10);
+    // sign
+    ctx.fillStyle = '#ffe060';
+    ctx.font = 'bold 7px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(s.name, x+TILE, y-20);
+  }
+}
+
+function drawSkeleton(x, y, frame, isApron) {
+  let f = frame % 4;
+  // skull
+  ctx.fillStyle = '#f0f0e0';
+  ctx.fillRect(x+3,y,10,10);
+  // eye sockets
+  ctx.fillStyle = '#101010';
+  ctx.fillRect(x+4,y+2,3,3);
+  ctx.fillRect(x+9,y+2,3,3);
+  // ribcage
+  ctx.fillStyle = '#f0f0e0';
+  ctx.fillRect(x+4,y+10,8,8);
+  ctx.fillStyle = '#c0c0b0';
+  for (let i = 0; i < 4; i++) ctx.fillRect(x+5, y+11+i*2, 6, 1);
+  // apron
+  if (isApron) {
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x+5,y+12,6,10);
+  }
+  // pelvis
+  ctx.fillStyle = '#f0f0e0';
+  ctx.fillRect(x+4,y+18,8,4);
+  // legs (animated)
+  ctx.fillStyle = '#f0f0e0';
+  let legOff = [0,2,0,-2][f];
+  ctx.fillRect(x+4, y+22, 3, 8+legOff);
+  ctx.fillRect(x+9, y+22, 3, 8-legOff);
+}
+
+function drawPlayer() {
+  if (player.inCar) return;
+  drawSkeleton(player.x, player.y, player.animFrame, true);
+}
+
+function drawCar() {
+  let x = car.x, y = car.y;
+  // body
+  ctx.fillStyle = '#dd2020';
+  ctx.fillRect(x, y+4, car.w, car.h-8);
+  ctx.fillRect(x+4, y, car.w-8, car.h);
+  // windows
+  ctx.fillStyle = '#a0e0f8';
+  ctx.fillRect(x+6, y+2, car.w-14, 6);
+  // wheels
+  ctx.fillStyle = '#202020';
+  ctx.fillRect(x+2, y+car.h-5, 6, 5);
+  ctx.fillRect(x+car.w-8, y+car.h-5, 6, 5);
+  ctx.fillRect(x+2, y, 6, 5);
+  ctx.fillRect(x+car.w-8, y, 6, 5);
+  // headlights
+  ctx.fillStyle = '#ffe080';
+  ctx.fillRect(x+car.w-3, y+4, 3, 4);
+  // driver visible
+  if (player.inCar) {
+    ctx.fillStyle = '#f0f0e0';
+    ctx.fillRect(x+9, y+3, 7, 7);
+    ctx.fillStyle = '#101010';
+    ctx.fillRect(x+10,y+4,2,2);
+    ctx.fillRect(x+13,y+4,2,2);
+  }
+}
+
+function drawCitizen(c) {
+  let x = c.x, y = c.y;
+  // robe
+  ctx.fillStyle = c.color;
+  ctx.fillRect(x+2, y+10, 10, 12);
+  // head
+  ctx.fillStyle = '#d4a060';
+  ctx.fillRect(x+3, y, 8, 9);
+  // hair
+  ctx.fillStyle = '#8040a0';
+  ctx.fillRect(x+3, y, 8, 3);
+  // eyes
+  ctx.fillStyle = '#202020';
+  ctx.fillRect(x+5,y+3,2,2);
+  ctx.fillRect(x+9,y+3,2,2);
+  // legs
+  ctx.fillStyle = '#d4a060';
+  let legO = [0,1,0,-1][c.animFrame%4];
+  ctx.fillRect(x+3,y+22,3,6+legO);
+  ctx.fillRect(x+8,y+22,3,6-legO);
+  // name
+  ctx.fillStyle = '#fff';
+  ctx.font = '7px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(c.name, x+7, y-4);
+  // speech bubble if waiting
+  if (c.state === 'waiting') {
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x-4, y-20, 30, 14);
+    ctx.fillStyle = '#404040';
+    ctx.font = '7px monospace';
+    ctx.textAlign = 'center';
+    let icon = c.want === 'food' ? '🍞' : c.want === 'haircut' ? '✂' : '🔧';
+    ctx.fillText(c.want, x+11, y-10);
+  }
+}
+
+function drawGuard(g) {
+  let x = g.x, y = g.y;
+  // armor body
+  ctx.fillStyle = '#c8a820';
+  ctx.fillRect(x+2, y+10, 10, 12);
+  // helmet
+  ctx.fillStyle = '#c8a820';
+  ctx.fillRect(x+3, y, 8, 8);
+  // plume (red)
+  ctx.fillStyle = '#dd2020';
+  ctx.fillRect(x+6, y-4, 2, 6);
+  // face
+  ctx.fillStyle = '#d4a060';
+  ctx.fillRect(x+4, y+1, 6, 5);
+  // spear
+  ctx.strokeStyle = '#8a6020';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x+14,y); ctx.lineTo(x+14,y+20); ctx.stroke();
+  ctx.fillStyle = '#c0c0c0';
+  ctx.fillRect(x+13, y-4, 3, 6);
+  // legs
+  ctx.fillStyle = '#c8a820';
+  let legO = [0,1,0,-1][g.animFrame%4];
+  ctx.fillRect(x+3,y+22,3,6+legO);
+  ctx.fillRect(x+8,y+22,3,6-legO);
+}
+
+function drawSocratesNPC() {
+  let s = socrates;
+  let x = s.x, y = s.y;
+  // robe
+  ctx.fillStyle = '#808080';
+  ctx.fillRect(x+2,y+10,10,14);
+  // head
+  ctx.fillStyle = '#d4a060';
+  ctx.fillRect(x+3,y,8,9);
+  // beard (gray)
+  ctx.fillStyle = '#b0b0b0';
+  ctx.fillRect(x+3,y+6,8,6);
+  // eyes
+  ctx.fillStyle = '#202020';
+  ctx.fillRect(x+5,y+2,2,2);
+  ctx.fillRect(x+9,y+2,2,2);
+  // legs
+  ctx.fillStyle = '#b0b0b0';
+  let legO = [0,1,0,-1][s.animFrame%4];
+  ctx.fillRect(x+3,y+24,3,6+legO);
+  ctx.fillRect(x+8,y+24,3,6-legO);
+  // label
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 8px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('Socrates', x+8, y-4);
+}
+
+function drawHUD() {
+  let y = WORLD_H;
+  ctx.fillStyle = '#181008';
+  ctx.fillRect(0, y, 640, HUD_H);
+  ctx.strokeStyle = '#c8a020';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, y, 640, HUD_H);
+
+  // HP
+  ctx.fillStyle = '#f0f0f0';
+  ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('HP', 6, y+14);
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = i < player.hp ? '#dd2020' : '#401010';
+    ctx.fillRect(28 + i*14, y+4, 12, 12);
+  }
+
+  // REP
+  ctx.fillStyle = '#f0f0f0';
+  ctx.fillText('REP', 6, y+30);
+  for (let i = 0; i < 10; i++) {
+    ctx.fillStyle = i < player.rep ? '#20cc20' : '#104010';
+    ctx.fillRect(36 + i*11, y+20, 9, 9);
+  }
+
+  // Gold + Score
+  ctx.fillStyle = '#ffe060';
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 11px monospace';
+  ctx.fillText(`GOLD: ${player.gold}`, 320, y+16);
+  ctx.fillStyle = '#80e0ff';
+  ctx.fillText(`SCORE: ${score}`, 320, y+32);
+
+  // WANTED
+  ctx.fillStyle = '#f0f0f0';
+  ctx.textAlign = 'right';
+  ctx.font = 'bold 10px monospace';
+  ctx.fillText('WANTED', 530, y+14);
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = i < player.wanted ? '#dd2020' : '#401010';
+    ctx.fillRect(534 + i*12, y+4, 10, 10);
+  }
+
+  // controls hint
+  ctx.fillStyle = '#a0a0a0';
+  ctx.font = '8px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('WASD:Move  E:Interact  F:Fight  R:Car', 636, y+30);
+
+  // notification bar (top)
+  if (notifTimer > 0) {
+    notifTimer--;
+    let alpha = Math.min(1, notifTimer / 40);
+    ctx.fillStyle = `rgba(0,0,0,${alpha*0.7})`;
+    ctx.fillRect(0,0,640,18);
+    ctx.fillStyle = `rgba(255,220,60,${alpha})`;
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(notification, 320, 12);
+  }
+
+  // context hint (near player)
+  if (contextHint) {
+    let hx = player.x + 10;
+    let hy = player.y - 14;
+    if (hy < 10) hy = player.y + player.h + 8;
+    if (hx > 540) hx = 540;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(hx-2, hy-10, contextHint.length*6+4, 14);
+    ctx.fillStyle = '#ffe060';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(contextHint, hx, hy);
+  }
+}
+
+function drawDialogue() {
+  if (!dialogOpen || !dialogQ) return;
+  let px = 40, py = 280, pw = 560, ph = 180;
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillRect(px, py, pw, ph);
+  ctx.strokeStyle = '#c8a020';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(px,py,pw,ph);
+
+  ctx.fillStyle = '#e0d090';
+  ctx.font = 'bold 12px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('Socrates says:', px+pw/2, py+20);
+  ctx.fillStyle = '#fff';
+  ctx.font = '11px monospace';
+  ctx.fillText(dialogQ.q[0], px+pw/2, py+40);
+  ctx.fillText(dialogQ.q[1], px+pw/2, py+56);
+
+  ctx.fillStyle = '#40dd40';
+  ctx.font = 'bold 10px monospace';
+  ctx.fillText(dialogQ.a1[0], px+pw/2, py+82);
+  ctx.fillStyle = '#20b020';
+  ctx.fillText(dialogQ.a1[1], px+pw/2, py+96);
+
+  ctx.fillStyle = '#40dd40';
+  ctx.font = 'bold 10px monospace';
+  ctx.fillText(dialogQ.a2[0], px+pw/2, py+116);
+  ctx.fillStyle = '#20b020';
+  ctx.fillText(dialogQ.a2[1], px+pw/2, py+130);
+
+  ctx.fillStyle = '#dd4040';
+  ctx.font = 'bold 10px monospace';
+  ctx.fillText('[F] Fight!', px+pw/2, py+155);
+}
+
+function drawShopMenu() {
+  if (!shopOpen || !shopRef) return;
+  let pw = 300, ph = 180;
+  let px = (640-pw)/2, py = (480-ph)/2;
+  ctx.fillStyle = 'rgba(0,0,0,0.88)';
+  ctx.fillRect(px,py,pw,ph);
+  ctx.strokeStyle = '#c8a020';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(px,py,pw,ph);
+
+  ctx.fillStyle = shopRef.color;
+  ctx.font = 'bold 13px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(shopRef.name, px+pw/2, py+22);
+  ctx.strokeStyle = '#c8a020';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(px+10,py+28); ctx.lineTo(px+pw-10,py+28); ctx.stroke();
+
+  const menuItems = {
+    food:    [['Gyros',15],['Olive Bread',10],['Wine',20]],
+    haircut: [['Short Cut',8],['Warrior Style',15],['Philosopher Cut',12]],
+    car:     [['Oil Change',25],['Axle Fix',40],['Full Restore',60]],
+  };
+  let items = menuItems[shopRef.type] || [];
+  ctx.fillStyle = '#f0f0e0';
+  ctx.font = '11px monospace';
+  for (let i = 0; i < items.length; i++) {
+    ctx.textAlign = 'left';
+    ctx.fillText(items[i][0], px+20, py+56+i*30);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ffe060';
+    ctx.fillText(items[i][1]+' gold', px+pw-20, py+56+i*30);
+    ctx.fillStyle = '#f0f0e0';
+  }
+  ctx.fillStyle = '#a0a0a0';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('[E] Close', px+pw/2, py+ph-10);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  ctx.fillRect(0,0,640,528);
+  ctx.fillStyle = '#dd2020';
+  ctx.font = 'bold 60px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('ARRESTED', 320, 180);
+  ctx.fillStyle = '#f0e080';
+  ctx.font = 'bold 18px monospace';
+  ctx.fillText(`Final Score: ${score}`, 320, 240);
+  ctx.fillText(`Gold: ${player.gold}`, 320, 268);
+  ctx.fillStyle = '#c0c0c0';
+  ctx.font = '14px monospace';
+  ctx.fillText('Press R to try again', 320, 320);
+}
+
+// ─── Game Loop ────────────────────────────────────────────────────────────────
+function update() {
+  if (gameOver) return;
+  tick++;
+  updatePlayer();
+  updateCar();
+  updateCustomers();
+  updateGuards();
+  updateSocrates();
+  updateWanted();
+  updateContextHint();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, 640, 528);
+  drawWorld();
+  drawShops();
+
+  // draw customers
+  for (let c of customers) drawCitizen(c);
+  // draw guards
+  for (let g of guards) drawGuard(g);
+  // draw Socrates
+  if (socrates.state !== 'idle' || socratesTimer > 400)
+    drawSocratesNPC();
+  // draw car
+  drawCar();
+  // draw player
+  drawPlayer();
+
+  drawHUD();
+  if (dialogOpen) drawDialogue();
+  if (shopOpen) drawShopMenu();
+  if (gameOver) drawGameOver();
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+initGame();
+loop();
+</script>
+</body>
+</html>
