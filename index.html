@@ -433,8 +433,23 @@ function updateCarDriving() {
 }
 
 function updateCar() {
-  // Car physics / idle update placeholder
-  // (movement handled in updateCarDriving when player is inside)
+  if (player.inCar) return; // driving handled by updateCarDriving
+
+  // Apply friction so the car coasts to a stop after player exits
+  const FRICTION = 0.85;
+  car.vx *= FRICTION;
+  car.vy *= FRICTION;
+  if (Math.abs(car.vx) < 0.05) car.vx = 0;
+  if (Math.abs(car.vy) < 0.05) car.vy = 0;
+
+  if (car.vx !== 0 || car.vy !== 0) {
+    let nx = car.x + car.vx;
+    let ny = car.y + car.vy;
+    if (!collidesWorld(nx, car.y, car.w, car.h)) car.x = nx; else car.vx = 0;
+    if (!collidesWorld(car.x, ny, car.w, car.h)) car.y = ny; else car.vy = 0;
+    car.x = Math.max(0, Math.min(COLS * TILE - car.w, car.x));
+    car.y = Math.max(0, Math.min(ROWS * TILE - car.h, car.y));
+  }
 }
 
 function updateCustomers() {
